@@ -35,6 +35,7 @@ function onOpen() {
     .addItem('② 出欠フォームを作成', 'createAttendanceForm')
     .addItem('③ 発表者別の審査フォームを一括作成', 'createReviewForms')
     .addItem('   選択行の審査フォームを作り直す', 'recreateSelectedReviewForms')
+    .addItem('⑤ 審査結果を集計（点数・順位）', 'updateSummary')
     .addSeparator()
     .addItem('④ 新年度の準備（入力のリセット）', 'resetForNewYear')
     .addToUi();
@@ -345,7 +346,7 @@ function buildQSheet_(sh, title, desc, confirm, questions) {
   sh.getRange('B1:B3').setBackground(C_IN).setVerticalAlignment('top');
   sh.getRange('A4').setValue('{設定のキー名} は設定シートの値に置換されます（例 {日付表示} {期} {会場名}）。{期一覧}=1期〜現役最終期。選択肢はカンマ区切り。目盛は「最小,最大,左ラベル,右ラベル」。')
     .setFontColor('#666666');
-  const head = ['順', '設問', '種類', '選択肢 / 目盛', '必須', '説明文', '表示条件'];
+  const head = ['順', '設問', '種類', '選択肢 / 目盛', '必須', '説明文', '表示条件', '配点の重み（審査のみ）'];
   styleHeader_(sh.getRange(5, 1, 1, head.length).setValues([head]));
   sh.getRange(Q_FIRST, 1, questions.length, 7).setValues(questions.map((q, i) => [i + 1].concat(q)));
   const n = 40;
@@ -356,7 +357,7 @@ function buildQSheet_(sh, title, desc, confirm, questions) {
     .requireValueInList(['○'], true).build()).setHorizontalAlignment('center');
   sh.getRange(Q_FIRST, 7, n, 1).setDataValidation(SpreadsheetApp.newDataValidation()
     .requireValueInList(['受講報告会'], true).setAllowInvalid(false).build());
-  [40, 420, 120, 300, 50, 320, 110].forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  [40, 420, 120, 300, 50, 320, 110, 130].forEach((w, i) => sh.setColumnWidth(i + 1, w));
   sh.setFrozenRows(5);
 }
 
@@ -439,11 +440,17 @@ function readQuestions_(sheetName) {
   const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
   if (!sh) throw new Error('シートがありません: ' + sheetName);
   const meta = sh.getRange(1, 2, 3, 1).getValues().map(r => r[0]);
+  if (sheetName === SHEET.QR && !sh.getRange(5, 8).getValue()) {
+    styleHeader_(sh.getRange(5, 8).setValue('配点の重み（審査のみ）'));
+    sh.setColumnWidth(8, 130);
+    sh.getRange(Q_FIRST, 8, 40, 1).setBackground(C_IN).setHorizontalAlignment('center');
+  }
   const n = Math.max(sh.getLastRow() - Q_FIRST + 1, 0);
-  const rows = n ? sh.getRange(Q_FIRST, 1, n, 7).getValues() : [];
+  const rows = n ? sh.getRange(Q_FIRST, 1, n, 8).getValues() : [];
   const items = rows.filter(r => String(r[1]).trim() !== '').map(r => ({
     title: String(r[1]), type: String(r[2]).trim(), choices: String(r[3]),
     required: String(r[4]).trim() === '○', help: String(r[5]), cond: String(r[6]).trim(),
+    weight: parseFloat(r[7]) > 0 ? parseFloat(r[7]) : 1,
   }));
   return { title: meta[0], desc: meta[1], confirm: meta[2], items: items };
 }
@@ -610,4 +617,101 @@ function resetForNewYear() {
   setSetting_('出欠フォーム編集URL', '');
   setSetting_('フォーム保存フォルダURL', '');
   ui.alert('初期化しました。「設定」シートの開催日・期を更新してください。');
+}
+
+/* ================= 審査結果の集計 ================= */
+
+const SUM_SHEET = '審査集計';
+const CMT_SHEET = '審査コメント';
+
+/**
+ * 発表者ごとの審査フォームの回答を読み、項目別平均・総合得点(100点満点換算)・順位を
+ * 「審査集計」シートに、自由記述を「審査コメント」シートに書き出す。何度でも再実行可。
+ * 総合得点 = 目盛項目ごとに (平均/最大値) を配点の重みで加重平均 ×100
+ */
+function updateSummary() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActive();
+  const pres = ss.getSheetByName(SHEET.PRES);
+  if (!pres) { ui.alert('先に「① 初期セットアップ」を実行してください。'); return; }
+  const map = readSettings_();
+  const q = readQuestions_(SHEET.QR);
+  const scales = q.items.filter(it => it.type === '目盛').map(it => {
+    const c = applyPh_(it.choices, map).split(/[,、\n]/).map(x => x.trim());
+    return { title: applyPh_(it.title, map), max: parseInt(c[1] || '5', 10), w: it.weight };
+  });
+  if (!scales.length) { ui.alert('審査フォーム設問に「目盛」の設問がありません。'); return; }
+  const texts = q.items.filter(it => it.type === '段落').map(it => applyPh_(it.title, map));
+  const nameTitle = (q.items.find(it => it.type === '記述式') || {}).title || '';
+
+  const data = pres.getRange(PRES_FIRST, 1, PRES_MAX, 7).getDisplayValues();
+  const results = [];
+  const comments = [];
+  data.forEach(d => {
+    if (!d[1].trim() || !d[6]) return;
+    const form = FormApp.openByUrl(d[6]);
+    const resps = form.getResponses();
+    const sum = scales.map(() => 0), cnt = scales.map(() => 0);
+    resps.forEach(r => {
+      let reviewer = '';
+      const its = r.getItemResponses();
+      its.forEach(ir => { if (ir.getItem().getTitle() === applyPh_(nameTitle, map)) reviewer = String(ir.getResponse()); });
+      its.forEach(ir => {
+        const t = ir.getItem().getTitle();
+        const si = scales.findIndex(s => s.title === t);
+        if (si >= 0) {
+          const v = Number(ir.getResponse());
+          if (!isNaN(v)) { sum[si] += v; cnt[si]++; }
+        } else if (texts.indexOf(t) >= 0 && String(ir.getResponse()).trim()) {
+          comments.push([d[0], d[1], reviewer, t, String(ir.getResponse())]);
+        }
+      });
+    });
+    const avgs = scales.map((s, i) => cnt[i] ? sum[i] / cnt[i] : '');
+    let num = 0, den = 0;
+    scales.forEach((s, i) => { if (avgs[i] !== '') { num += s.w * avgs[i] / s.max; den += s.w; } });
+    results.push({
+      no: d[0], name: d[1], title: d[2], n: resps.length, avgs: avgs,
+      score: den ? Math.round(num / den * 10000) / 100 : '',
+    });
+  });
+  if (!results.length) { ui.alert('集計対象がありません（審査フォーム未作成）。'); return; }
+
+  // 並べ替えと順位（同点は同順位）
+  results.sort((a, b) => (b.score === '' ? -1 : b.score) - (a.score === '' ? -1 : a.score));
+  let rank = 0, prev = null;
+  results.forEach((r, i) => {
+    if (r.score === '') { r.rank = '-'; return; }
+    if (r.score !== prev) rank = i + 1;
+    r.rank = rank; prev = r.score;
+  });
+
+  const sh = ss.getSheetByName(SUM_SHEET) || ss.insertSheet(SUM_SHEET);
+  sh.clear(); sh.setConditionalFormatRules([]);
+  sh.getRange('A1').setValue('審査集計（点数・順位）').setFontSize(14).setFontWeight('bold');
+  sh.getRange('A2').setValue('更新: ' + Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), 'yyyy/MM/dd HH:mm') +
+    ' ／ 総合得点は目盛項目の平均を最大値で割り、配点の重み（審査フォーム設問シート H列）で加重平均して100点満点に換算').setFontColor('#666666');
+  const best = results.filter(r => r.rank === 1);
+  if (best.length) sh.getRange('A3').setValue('最優秀賞候補： ' + best.map(r => r.name).join(' / ')).setFontWeight('bold').setFontColor('#c00000');
+  const head = ['順位', '番号', '発表者', '論文タイトル', '回答数'].concat(scales.map(s => s.title + '\n(平均/' + s.max + ')'), ['総合得点\n(100点満点)']);
+  styleHeader_(sh.getRange(5, 1, 1, head.length).setValues([head])).setWrap(true);
+  const rows = results.map(r => [r.rank, r.no, r.name, r.title, r.n].concat(r.avgs.map(a => a === '' ? '' : Math.round(a * 100) / 100), [r.score]));
+  sh.getRange(6, 1, rows.length, head.length).setValues(rows).setVerticalAlignment('middle');
+  sh.getRange(6, 6, rows.length, scales.length).setNumberFormat('0.00');
+  sh.getRange(6, head.length, rows.length, 1).setNumberFormat('0.00').setFontWeight('bold');
+  sh.getRange(6, 1, rows.length, 2).setHorizontalAlignment('center');
+  const colors = { 1: '#ffe699', 2: '#e7e6e6', 3: '#f8cbad' };
+  rows.forEach((r, i) => { if (colors[r[0]]) sh.getRange(6 + i, 1, 1, head.length).setBackground(colors[r[0]]); });
+  [50, 50, 200, 280, 60].concat(scales.map(() => 95), [110]).forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  sh.setRowHeight(5, 50);
+  sh.setFrozenRows(5);
+
+  const cs = ss.getSheetByName(CMT_SHEET) || ss.insertSheet(CMT_SHEET);
+  cs.clear();
+  styleHeader_(cs.getRange(1, 1, 1, 5).setValues([['番号', '発表者', '審査者', '項目', 'コメント']]));
+  if (comments.length) cs.getRange(2, 1, comments.length, 5).setValues(comments).setWrap(true).setVerticalAlignment('top');
+  [50, 160, 140, 140, 600].forEach((w, i) => cs.setColumnWidth(i + 1, w));
+  cs.setFrozenRows(1);
+  ss.setActiveSheet(sh);
+  ui.alert('集計しました。「' + SUM_SHEET + '」「' + CMT_SHEET + '」シートを確認してください。');
 }
