@@ -36,6 +36,7 @@ function onOpen() {
     .addItem('③ 発表者別の審査フォームを一括作成', 'createReviewForms')
     .addItem('   選択行の審査フォームを作り直す', 'recreateSelectedReviewForms')
     .addItem('⑤ 審査結果を集計（点数・順位）', 'updateSummary')
+    .addItem('⑥ 不要な回答タブを整理（削除）', 'cleanupResponseSheets')
     .addSeparator()
     .addItem('④ 新年度の準備（入力のリセット）', 'resetForNewYear')
     .addToUi();
@@ -157,6 +158,7 @@ const C_IN = '#fff8dc', C_CALC = '#eeeeee', C_HEAD = '#1f4e79', C_SEC = '#d9e2f3
 function styleHeader_(range) {
   range.setBackground(C_HEAD).setFontColor('#ffffff').setFontWeight('bold')
     .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  return range;
 }
 
 /* ---------- 設定 ---------- */
@@ -563,7 +565,7 @@ function createReviewForms_(force, onlyRows) {
   const map = readSettings_();
   const sh = SpreadsheetApp.getActive().getSheetByName(SHEET.PRES);
   const q = readQuestions_(SHEET.QR);
-  const data = sh.getRange(PRES_FIRST, 1, PRES_MAX, 6).getDisplayValues();
+  const data = sh.getRange(PRES_FIRST, 1, PRES_MAX, 7).getDisplayValues();
   const rows = [];
   data.forEach((d, i) => {
     const r = PRES_FIRST + i;
@@ -573,8 +575,11 @@ function createReviewForms_(force, onlyRows) {
     rows.push(r);
   });
   if (!rows.length) { ui.alert('作成対象がありません（氏名が空、または作成済み）。'); return; }
+  const hasOld = rows.some(r => data[r - PRES_FIRST][6]);
   const ok = ui.alert('審査フォーム作成',
-    rows.length + ' 件の審査フォームを作成します。よろしいですか？', ui.ButtonSet.YES_NO);
+    rows.length + ' 件の審査フォームを作成します。' +
+    (hasOld ? '\n\n※作り直す発表者の古い回答タブは削除されます（回答データは古いフォーム側に残ります）。' : '') +
+    '\nよろしいですか？', ui.ButtonSet.YES_NO);
   if (ok !== ui.Button.YES) return;
   const folder = getFolder_(map);
   const toSheet = map['審査回答をこのシートに集約'] === 'はい';
@@ -586,6 +591,7 @@ function createReviewForms_(force, onlyRows) {
       '番号': num, '発表者': d[1].trim(),
       '論文タイトル': d[2] || '（未定）', '発表時間': d[3] && d[4] ? d[3] + '～' + d[4] : '',
     });
+    if (d[6]) removeResponseSheetsOf_(formIdOf_(d[6]));
     const form = FormApp.create(applyPh_(q.title, m));
     buildForm_(form, q, m);
     DriveApp.getFileById(form.getId()).moveTo(folder);
@@ -595,6 +601,69 @@ function createReviewForms_(force, onlyRows) {
     done++;
   });
   ui.alert(done + ' 件の審査フォームを作成しました。「発表者」シートにURLを記入しています。');
+}
+
+/* ================= 回答タブの整理 ================= */
+
+function formIdOf_(url) {
+  const m = String(url || '').match(/\/forms\/d\/(?!e\/)([^\/?#]+)/);
+  return m ? m[1] : '';
+}
+
+function linkedFormId_(sheet) {
+  let url = '';
+  try { url = sheet.getFormUrl(); } catch (e) { return ''; }
+  if (!url) return '';
+  const id = formIdOf_(url);
+  if (id) return id;
+  try { return FormApp.openByUrl(url).getId(); } catch (e) { return ''; }
+}
+
+/** 指定フォームに紐づく回答タブの紐づけを解除して削除する。削除したタブ名を返す */
+function removeResponseSheetsOf_(formId) {
+  const ss = SpreadsheetApp.getActive();
+  const removed = [];
+  if (!formId) return removed;
+  ss.getSheets().filter(sh => linkedFormId_(sh) === formId).forEach(sh => {
+    const name = sh.getName();
+    try { FormApp.openById(formId).removeDestination(); } catch (e) { /* フォーム削除済みなど */ }
+    try {
+      SpreadsheetApp.flush();
+      ss.deleteSheet(sh);
+      removed.push(name);
+    } catch (e) { /* 削除できなければ手動で「フォームの紐付けを解除」 */ }
+  });
+  return removed;
+}
+
+/** 現在使っているフォーム（出欠・各審査）以外に紐づく回答タブを一覧にして、確認のうえ削除する */
+function cleanupResponseSheets() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActive();
+  const keep = {};
+  const map = readSettings_();
+  keep[formIdOf_(map['出欠フォームURL'] ? map['出欠フォーム編集URL'] : '')] = true;
+  const pres = ss.getSheetByName(SHEET.PRES);
+  pres.getRange(PRES_FIRST, 7, PRES_MAX, 1).getDisplayValues().forEach(r => { keep[formIdOf_(r[0])] = true; });
+  const targets = ss.getSheets().filter(sh => {
+    const id = linkedFormId_(sh);
+    return id && !keep[id];
+  });
+  if (!targets.length) { ui.alert('削除対象の回答タブはありません。'); return; }
+  const r = ui.alert('不要な回答タブの削除',
+    '現在のフォームに紐づいていない次の回答タブを削除します。\n\n' +
+    targets.map(sh => '・' + sh.getName()).join('\n') +
+    '\n\n※フォームとの紐づけを解除して削除します。回答データ自体は各フォーム側に残ります。\n削除しますか？',
+    ui.ButtonSet.YES_NO);
+  if (r !== ui.Button.YES) return;
+  const failed = [];
+  targets.forEach(sh => {
+    const name = sh.getName();
+    const id = linkedFormId_(sh);
+    try { FormApp.openById(id).removeDestination(); } catch (e) { /* 無視 */ }
+    try { SpreadsheetApp.flush(); ss.deleteSheet(sh); } catch (e) { failed.push(name); }
+  });
+  ui.alert('削除しました。' + (failed.length ? '\n\n削除できなかったタブ（手動で対応してください）:\n' + failed.join('\n') : ''));
 }
 
 /* ================= 新年度リセット ================= */
