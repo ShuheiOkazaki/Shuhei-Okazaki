@@ -37,6 +37,7 @@ function onOpen() {
     .addItem('   選択行の審査フォームを作り直す', 'recreateSelectedReviewForms')
     .addItem('⑤ 審査結果を集計（点数・順位）', 'updateSummary')
     .addItem('⑥ 不要な回答タブを整理（削除）', 'cleanupResponseSheets')
+    .addItem('⑦ 今開いているタブを削除（フォーム紐づけ解除）', 'deleteActiveSheet')
     .addSeparator()
     .addItem('④ 新年度の準備（入力のリセット）', 'resetForNewYear')
     .addToUi();
@@ -619,21 +620,55 @@ function linkedFormId_(sheet) {
   try { return FormApp.openByUrl(url).getId(); } catch (e) { return ''; }
 }
 
-/** 指定フォームに紐づく回答タブの紐づけを解除して削除する。削除したタブ名を返す */
+/** フォームとの紐づけを解除してからタブを削除する。成功したら true */
+function unlinkAndDelete_(sheet) {
+  const ss = SpreadsheetApp.getActive();
+  let url = '';
+  try { url = sheet.getFormUrl(); } catch (e) { /* 紐づけなし */ }
+  if (url) {
+    let form = null;
+    try { form = FormApp.openByUrl(url); } catch (e) {
+      const id = formIdOf_(url);
+      if (id) { try { form = FormApp.openById(id); } catch (e2) { /* 開けない */ } }
+    }
+    if (form) { try { form.removeDestination(); } catch (e) { /* 既に解除済みなど */ } }
+  }
+  for (let i = 0; i < 4; i++) {
+    SpreadsheetApp.flush();
+    Utilities.sleep(1500);
+    try { ss.deleteSheet(sheet); return true; } catch (e) { /* 反映待ちで再試行 */ }
+  }
+  return false;
+}
+
+/** 指定フォームに紐づく回答タブを削除する。削除したタブ名を返す */
 function removeResponseSheetsOf_(formId) {
   const ss = SpreadsheetApp.getActive();
   const removed = [];
   if (!formId) return removed;
   ss.getSheets().filter(sh => linkedFormId_(sh) === formId).forEach(sh => {
     const name = sh.getName();
-    try { FormApp.openById(formId).removeDestination(); } catch (e) { /* フォーム削除済みなど */ }
-    try {
-      SpreadsheetApp.flush();
-      ss.deleteSheet(sh);
-      removed.push(name);
-    } catch (e) { /* 削除できなければ手動で「フォームの紐付けを解除」 */ }
+    if (unlinkAndDelete_(sh)) removed.push(name);
   });
   return removed;
+}
+
+/** 今開いているタブ1枚を、フォームとの紐づけを解除して削除する */
+function deleteActiveSheet() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getActiveSheet();
+  const name = sh.getName();
+  if (Object.values(SHEET).indexOf(name) >= 0) {
+    ui.alert('「' + name + '」はツールの基本シートなので削除できません。');
+    return;
+  }
+  const linked = linkedFormId_(sh) ? 'フォームとの紐づけを解除してから' : '';
+  const r = ui.alert('タブの削除', '「' + name + '」を' + linked + '削除します。\n（フォーム側の回答データは残ります）\nよろしいですか？', ui.ButtonSet.YES_NO);
+  if (r !== ui.Button.YES) return;
+  if (!unlinkAndDelete_(sh)) {
+    ui.alert('削除できませんでした。\n数秒おいて再実行するか、このタブの「フォーム」メニュー >「フォームとのリンクを解除」を実行してから手動で削除してください。');
+  }
 }
 
 /** 現在使っているフォーム（出欠・各審査）以外に紐づく回答タブを一覧にして、確認のうえ削除する */
@@ -659,9 +694,7 @@ function cleanupResponseSheets() {
   const failed = [];
   targets.forEach(sh => {
     const name = sh.getName();
-    const id = linkedFormId_(sh);
-    try { FormApp.openById(id).removeDestination(); } catch (e) { /* 無視 */ }
-    try { SpreadsheetApp.flush(); ss.deleteSheet(sh); } catch (e) { failed.push(name); }
+    if (!unlinkAndDelete_(sh)) failed.push(name);
   });
   ui.alert('削除しました。' + (failed.length ? '\n\n削除できなかったタブ（手動で対応してください）:\n' + failed.join('\n') : ''));
 }
